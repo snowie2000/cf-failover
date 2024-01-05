@@ -36,3 +36,7 @@ cd api-failover
 go install
 ```
 
+## Credit
+Originally created by https://github.com/slashtechno/api-failover
+
+TcpPing implemented by https://github.com/cloverstd/tcping
