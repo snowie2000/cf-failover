@@ -2,10 +2,12 @@ module github.com/slashtechno/api-failover
 
 go 1.19
 
+replace github.com/cloverstd/tcping/ping => ./ping
+
 require (
 	github.com/alexflint/go-arg v1.4.3
 	github.com/cloudflare/cloudflare-go v0.57.1
-	github.com/joho/godotenv v1.5.1
+	github.com/cloverstd/tcping/ping v0.0.0-00010101000000-000000000000
 	github.com/prometheus-community/pro-bing v0.3.0
 	github.com/sirupsen/logrus v1.9.2
 )

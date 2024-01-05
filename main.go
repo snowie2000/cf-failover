@@ -3,15 +3,23 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alexflint/go-arg"
 	"github.com/cloudflare/cloudflare-go"
-	"github.com/joho/godotenv"
+	"github.com/cloverstd/tcping/ping"
+	"github.com/cloverstd/tcping/ping/http"
+	"github.com/cloverstd/tcping/ping/tcp"
 	probing "github.com/prometheus-community/pro-bing"
 	"github.com/sirupsen/logrus"
 )
@@ -25,21 +33,40 @@ import (
 //
 // )
 
-var args struct {
-	// Primary []string `arg:"-p, --primary, required, separate, env:PRIMARY_IPs" help:"Primary IPs (A record)"`
-	// Backup  []string `arg:"-b, --backup, required, separate, env:BACKUP_IPs" help:"Backup IPs (A record)" `
-	PrimaryHosts       string `arg:"-p, --primary, env:PRIMARY_IPs" help:"Primary hosts to be created as A records - IPs should be comma-separated without spaces. Example: \"0.0.0.0,0.0.0.0\"" `
-	BackupHosts        string `arg:"-b, --backup, env:BACKUP_IPs" help:"Backup hosts to be created as A records - IPs should be comma-separated without spaces. Example: \"0.0.0.0,0.0.0.0\"" `
-	CloudflareApiToken string `arg:"env:CLOUDFLARE_API_TOKEN, required" help:"Cloudflare API token"`
-	CloudflareZoneID   string `arg:"env:CLOUDFLARE_ZONE_ID, required" help:"Cloudflare Zone ID"`
-	RecordName         string `arg:"env:RECORD_NAME, required" help:"Record name to use. Example: \"foo.example.com\"" `
-	ProxyRecords       bool   `arg:"env:PROXY_RECORDS" help:"Proxy records" default:"true"`
+type service struct {
+	Primary  []string `json:"primary"`
+	Backup   []string `json:"backup"`
+	Token    string   `json:"token"`
+	Zone     string   `json:"zoneid"`
+	Record   string   `json:"record"`
+	Method   string   `json:"method"`
+	Param    string   `json:"param"`
+	Proxied  bool     `json:"proxied"`
+	Interval int32    `json:"interval"`
+}
+
+type Config []service
+
+type HostInfo struct {
+	PrimaryHosts       []string `arg:"-p, --primary, env:PRIMARY_IPs" help:"Primary hosts to be created as A records - IPs should be comma-separated without spaces. Example: \"0.0.0.0,0.0.0.0\"" `
+	BackupHosts        []string `arg:"-b, --backup, env:BACKUP_IPs" help:"Backup hosts to be created as A records - IPs should be comma-separated without spaces. Example: \"0.0.0.0,0.0.0.0\"" `
+	CloudflareApiToken string   `arg:"env:CLOUDFLARE_API_TOKEN, required" help:"Cloudflare API token"`
+	CloudflareZoneID   string   `arg:"env:CLOUDFLARE_ZONE_ID, required" help:"Cloudflare Zone ID"`
+	RecordName         string   `arg:"env:RECORD_NAME, required" help:"Record name to use. Example: \"foo.example.com\"" `
+	ProxyRecords       bool     `arg:"env:PROXY_RECORDS" help:"Proxy records" default:"true"`
 
 	LogLevel        string `arg:"--log-level, env:LOG_LEVEL" help:"\"debug\", \"info\" (default), \"warning\", \"error\", or \"fatal\"" ` // ~~Could~~ Should add default value
 	ForceLogColor   bool   `arg:"--force-log-color, env:FORCE_LOG_COLOR" help:"Force colored logs" default:"true"`
 	DisableLogColor bool   `arg:"--disable-log-color, env:DISABLE_LOG_COLOR" help:"Disable colored logs - Overrides --force-log-color" `
 
 	LoopProgram bool `arg:"-l, --loop-program, env:LOOP_PROGRAM" help:"Loop program" default:"false"`
+	Interval    int32
+	Pinger      func(ip string) bool
+}
+
+var appArg struct {
+	Config   string `arg:"-c, --config" help:"Config file name" default:"config.json"`
+	LogLevel string `arg:"-l, --loglevel" help:"Log level" default:"warn"`
 }
 
 type HostSet struct {
@@ -53,31 +80,85 @@ type HostSet struct {
 	} `json:"backup"`
 }
 
+func rel2abs(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	execPath, err := os.Executable()
+	if err != nil {
+		logrus.Fatalln("Error getting executable path:", err)
+	}
+	execDir := filepath.Dir(execPath)
+	return filepath.Join(execDir, path)
+}
+
 func main() {
-	godotenv.Load()
-	arg.MustParse(&args)
+	setup()
+	arg.MustParse(&appArg)
 
-	logrus.SetOutput(os.Stdout)
-	logrus.SetFormatter(&logrus.TextFormatter{PadLevelText: true, DisableQuote: true, ForceColors: args.ForceLogColor, DisableColors: args.DisableLogColor})
+	var config Config
+	if appArg.Config == "" {
+		appArg.Config = "config.json"
+	}
+	appArg.Config = rel2abs(appArg.Config)
 
-	if args.LogLevel == "debug" {
-		logrus.SetLevel(logrus.DebugLevel)
-	} else if args.LogLevel == "info" {
-		logrus.SetLevel(logrus.InfoLevel)
-	} else if args.LogLevel == "warning" {
-		logrus.SetLevel(logrus.WarnLevel)
-	} else if args.LogLevel == "error" {
-		logrus.SetLevel(logrus.ErrorLevel)
-	} else if args.LogLevel == "fatal" {
-		logrus.SetLevel(logrus.FatalLevel)
+	if data, err := ioutil.ReadFile(appArg.Config); err != nil {
+		logrus.Fatalln("can't read config file", err)
+		return
 	} else {
-		logrus.SetLevel(logrus.InfoLevel)
+		if err = json.Unmarshal(data, &config); err != nil {
+			logrus.Fatalln("parse config file error:", err)
+			return
+		}
 	}
 
+	logrus.SetOutput(os.Stdout)
+	logrus.SetFormatter(&logrus.TextFormatter{PadLevelText: true, DisableQuote: true, ForceColors: true, DisableColors: false})
+	if lvl, err := logrus.ParseLevel(appArg.LogLevel); err == nil {
+		logrus.SetLevel(lvl)
+	} else {
+		logrus.SetLevel(logrus.WarnLevel)
+	}
+
+	var wg sync.WaitGroup
+	for _, item := range config {
+		var host HostInfo
+		host.PrimaryHosts = item.Primary
+		host.BackupHosts = item.Backup
+		host.CloudflareApiToken = item.Token
+		host.CloudflareZoneID = item.Zone
+		host.RecordName = item.Record
+		host.ProxyRecords = item.Proxied
+		host.LoopProgram = true
+		if item.Interval == 0 {
+			host.Interval = 10
+		} else {
+			host.Interval = item.Interval
+		}
+		switch item.Method {
+		case "ping":
+			host.Pinger = icmpPing
+		case "tcp":
+			port, e := strconv.Atoi(item.Param)
+			if e != nil {
+				port = 80
+			}
+			host.Pinger, e = makeTcpPinger(1, int32(port))
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			serveHost(host)
+		}()
+	}
+	wg.Wait()
+}
+
+func serveHost(host HostInfo) {
 	// Output configuation
-	logrus.Infof("Backup hosts: %v; Primary hosts %v", args.BackupHosts, args.PrimaryHosts)
+	logrus.Infof("Backup hosts: %v; Primary hosts %v", host.BackupHosts, host.PrimaryHosts)
 	// Create an API client object
-	cloudflareApi, err := cloudflare.NewWithAPIToken(args.CloudflareApiToken)
+	cloudflareApi, err := cloudflare.NewWithAPIToken(host.CloudflareApiToken)
 	checkNilErr(err)
 	ctx := context.Background()
 
@@ -91,7 +172,7 @@ func main() {
 	for _, zone := range zones {
 		logrus.Infof("Zone name: %v; Zone ID: %v", zone.Name, zone.ID)
 	}
-	zoneId := args.CloudflareZoneID
+	zoneId := host.CloudflareZoneID
 	if zoneId == "" {
 		fmt.Print("Zone ID: ")
 		zoneId = singleLineInput()
@@ -102,7 +183,7 @@ func main() {
 
 		// Creating a cloudflare.DNSRecord object can allow for filtering
 		// Example: foo := cloudflare.DNSRecord{Name: "foo.example.com"}
-		recordName := args.RecordName
+		recordName := host.RecordName
 		if recordName == "" {
 			fmt.Print("Record Name (example: foo.example.com): ")
 			recordName = singleLineInput()
@@ -123,8 +204,8 @@ func main() {
 
 		// Create a HostSet object
 		hostSet := HostSet{}
-		hostSet.Primary.Hosts = strings.Split(args.PrimaryHosts, ",")
-		hostSet.Backup.Hosts = strings.Split(args.BackupHosts, ",")
+		hostSet.Primary.Hosts = host.PrimaryHosts
+		hostSet.Backup.Hosts = host.BackupHosts
 
 		// Check what set of hosts is being used, primary or backup
 		var ipSet string
@@ -144,7 +225,7 @@ func main() {
 		logrus.Debugf("Primary hosts: %v", hostSet.Primary.Hosts)
 		for _, ip := range hostSet.Primary.Hosts {
 			logrus.Infof("Pinging %v", ip)
-			if ping(ip) {
+			if host.Pinger(ip) {
 				// Append the IP to the list of online hosts
 				hostSet.Primary.OnlineHosts = append(hostSet.Primary.OnlineHosts, ip)
 			}
@@ -154,7 +235,7 @@ func main() {
 		logrus.Debugf("Backup hosts: %v", hostSet.Backup.Hosts)
 		for _, ip := range hostSet.Backup.Hosts {
 			logrus.Infof("Pinging %v", ip)
-			if ping(ip) {
+			if host.Pinger(ip) {
 				// Append the IP to the list of online hosts
 				hostSet.Backup.OnlineHosts = append(hostSet.Backup.OnlineHosts, ip)
 			}
@@ -162,7 +243,7 @@ func main() {
 		logrus.Infof("Online backup hosts: %v", len(hostSet.Backup.OnlineHosts))
 
 		// Only switch records if both sets of hosts have been specified
-		if args.BackupHosts != "" && args.PrimaryHosts != "" {
+		if len(host.BackupHosts) > 0 && len(host.PrimaryHosts) > 0 {
 			if len(hostSet.Primary.OnlineHosts) > 0 && ipSet == "primary" {
 				logrus.Debugf("Primary hosts: %v\nPrimary hosts length %v", hostSet.Primary.Hosts, len(hostSet.Primary.Hosts))
 				logrus.Info("Primary hosts are up and record is set to primary, doing nothing")
@@ -171,18 +252,18 @@ func main() {
 
 				// If the number of current records is equal to the number of primary hosts, update the records
 				if len(records) == len(hostSet.Primary.Hosts) {
-					logrus.Info("Updating records to primary IPs")
+					logrus.Warn("Updating records to primary IPs")
 					for i, record := range records {
 						// Update the record variable
 						record.Content = hostSet.Primary.Hosts[i]
-						record.Proxied = &args.ProxyRecords
+						record.Proxied = &host.ProxyRecords
 						// Update the record on Cloudflare
 						err = cloudflareApi.UpdateDNSRecord(ctx, zoneId, record.ID, record)
 						checkNilErr(err)
 					}
 				} else {
 					// If the number of current records is not equal to the number of primary hosts, delete all records and create new ones
-					logrus.Info("Deleting records and creating new ones")
+					logrus.Warn("Deleting records and creating new ones")
 					for _, record := range records {
 						err = cloudflareApi.DeleteDNSRecord(ctx, zoneId, record.ID)
 						checkNilErr(err)
@@ -192,8 +273,8 @@ func main() {
 							Type:    "A",
 							Name:    recordName,
 							Content: ip,
-							TTL:     1,
-							Proxied: &args.ProxyRecords,
+							TTL:     300,
+							Proxied: &host.ProxyRecords,
 						}
 						_, err = cloudflareApi.CreateDNSRecord(ctx, zoneId, record)
 						checkNilErr(err)
@@ -204,16 +285,16 @@ func main() {
 
 				// If the number of current records is equal to the number of backup hosts, update the records
 				if len(records) == len(hostSet.Backup.Hosts) {
-					logrus.Info("Updating records to backup IPs")
+					logrus.Warn("Updating records to backup IPs")
 					for i, record := range records {
 						record.Content = hostSet.Backup.Hosts[i]
-						record.Proxied = &args.ProxyRecords
+						record.Proxied = &host.ProxyRecords
 						err = cloudflareApi.UpdateDNSRecord(ctx, zoneId, record.ID, record)
 						checkNilErr(err)
 					}
 				} else {
 					// If the number of current records is not equal to the number of backup hosts, delete all records and create new ones
-					logrus.Info("Deleting records and creating new ones")
+					logrus.Warn("Deleting records and creating new ones")
 					for _, record := range records {
 						err = cloudflareApi.DeleteDNSRecord(ctx, zoneId, record.ID)
 						checkNilErr(err)
@@ -223,8 +304,8 @@ func main() {
 							Type:    "A",
 							Name:    recordName,
 							Content: ip,
-							TTL:     1,
-							Proxied: &args.ProxyRecords,
+							TTL:     300,
+							Proxied: &host.ProxyRecords,
 						}
 						_, err = cloudflareApi.CreateDNSRecord(ctx, zoneId, record)
 						checkNilErr(err)
@@ -238,22 +319,66 @@ func main() {
 			logrus.Info("No primary or backup hosts specified, doing nothing")
 		}
 		// If loop is set to false, exit the program
-		if !args.LoopProgram {
-			os.Exit(0)
+		if !host.LoopProgram {
+			return
 		}
 
 		// Will only run if the program is looping
-		time.Sleep(time.Duration(time.Duration(1).Seconds()))
-		godotenv.Load()
-		arg.MustParse(&args)
+		time.Sleep(time.Second * time.Duration(host.Interval))
 
 	}
 }
 
-func ping(host string) bool {
+func setup() {
+	httpMethod := "GET"
+	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+	ping.Register(ping.HTTP, func(url *url.URL, op *ping.Option) (ping.Ping, error) {
+		op.UA = userAgent
+		return http.New(httpMethod, url.String(), op, false)
+	})
+	ping.Register(ping.HTTPS, func(url *url.URL, op *ping.Option) (ping.Ping, error) {
+		op.UA = userAgent
+		return http.New(httpMethod, url.String(), op, false)
+	})
+	ping.Register(ping.TCP, func(url *url.URL, op *ping.Option) (ping.Ping, error) {
+		port, err := strconv.Atoi(url.Port())
+		if err != nil {
+			return nil, err
+		}
+		return tcp.New(url.Hostname(), port, op, false), nil
+	})
+}
+
+func makeTcpPinger(interval int32, port int32) (func(string) bool, error) {
+	timeoutDuration := time.Second * time.Duration(5)
+	intervalDuration := time.Second * time.Duration(interval)
+	defaultCount := 5
+	protocol, _ := ping.NewProtocol("tcp")
+
+	option := ping.Option{
+		Timeout: timeoutDuration,
+	}
+	pingFactory := ping.Load(protocol)
+
+	return func(ip string) bool {
+		u, _ := ping.ParseAddress(fmt.Sprintf("%s:%d", ip, port))
+		p, err := pingFactory(u, &option)
+		if err != nil {
+			return false
+		}
+
+		pinger := ping.NewPinger(ioutil.Discard, u, p, intervalDuration, defaultCount)
+		pinger.Ping()
+		logrus.Infof("TCPing %v result: total=%d, failed=%d", u, pinger.Total, pinger.FailedTotal)
+		return pinger.FailedTotal < pinger.Total
+	}, nil
+}
+
+func icmpPing(host string) bool {
 	pinger, err := probing.NewPinger(host)
 	checkNilErr(err)
-	pinger.Count = 3
+	pinger.Count = 5
 	pinger.Timeout = 5 * time.Second
 	pinger.SetPrivileged(true)
 	// Both Windows and the Docker image work with privileged pings by default
