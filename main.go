@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -154,6 +155,19 @@ func main() {
 	wg.Wait()
 }
 
+func resolveHosts(hosts []string) []string {
+	var ips []string
+	for _, domain := range hosts {
+		ip, err := net.ResolveIPAddr("ip", domain)
+		if err == nil {
+			ips = append(ips, ip.IP.String())
+		} else {
+			fmt.Println(err)
+		}
+	}
+	return ips
+}
+
 func serveHost(host HostInfo) {
 	// Output configuation
 	logrus.Infof("Backup hosts: %v; Primary hosts %v", host.BackupHosts, host.PrimaryHosts)
@@ -204,8 +218,8 @@ func serveHost(host HostInfo) {
 
 		// Create a HostSet object
 		hostSet := HostSet{}
-		hostSet.Primary.Hosts = host.PrimaryHosts
-		hostSet.Backup.Hosts = host.BackupHosts
+		hostSet.Primary.Hosts = resolveHosts(host.PrimaryHosts)
+		hostSet.Backup.Hosts = resolveHosts(host.BackupHosts)
 
 		// Check what set of hosts is being used, primary or backup
 		var ipSet string
@@ -247,7 +261,7 @@ func serveHost(host HostInfo) {
 			if len(hostSet.Primary.OnlineHosts) > 0 && ipSet == "primary" {
 				logrus.Debugf("Primary hosts: %v\nPrimary hosts length %v", hostSet.Primary.Hosts, len(hostSet.Primary.Hosts))
 				logrus.Info("Primary hosts are up and record is set to primary, doing nothing")
-			} else if len(hostSet.Primary.OnlineHosts) > 0 && ipSet == "backup" {
+			} else if len(hostSet.Primary.OnlineHosts) > 0 && (ipSet == "backup" || ipSet == "unknown") {
 				// If at least one primary host is up and the records are set to backup hosts, update the records to the primary hosts
 
 				// If the number of current records is equal to the number of primary hosts, update the records
@@ -280,7 +294,7 @@ func serveHost(host HostInfo) {
 						checkNilErr(err)
 					}
 				}
-			} else if len(hostSet.Primary.OnlineHosts) == 0 && ipSet == "primary" {
+			} else if len(hostSet.Primary.OnlineHosts) == 0 && (ipSet == "primary" || ipSet == "unknown") {
 				// If no primary hosts are up and the records are set to primary hosts, update the records to the backup hosts
 
 				// If the number of current records is equal to the number of backup hosts, update the records
@@ -311,10 +325,11 @@ func serveHost(host HostInfo) {
 						checkNilErr(err)
 					}
 				}
-			} else if ipSet == "unknown" {
+			}
+			/*else if ipSet == "unknown" {
 				// If the record is set to an unknown IP set, don't do antyhing
 				logrus.Info("Record is set to an unknown IP set, doing nothing")
-			}
+			}*/
 		} else {
 			logrus.Info("No primary or backup hosts specified, doing nothing")
 		}
